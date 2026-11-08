@@ -1,42 +1,107 @@
-name: uv publish sdist to PyPI
+name: Publish Python source package to PyPI
 
+# The existing publish-pypi-bdist-linux.yml owns wheel publication.
+# Manual runs validate the source package without uploading it.
+# Required repository secret: PYPI_API_TOKEN (scoped to the tofu PyPI project).
 on:
   release:
-    types:
-      [created]
-  push:
-    branches:
-      - master
-      - deploy-test
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-sdist-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
-
-    runs-on: ubuntu-latest
+  publish:
+    name: Build, validate, and publish source distribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      # pyproject.toml supports Python >=3.10,<3.12.
+      PYTHON_VERSION: '3.11'
 
     steps:
-    
-      # git checkout
-    - name: git checkout
-      uses: actions/checkout@v5
-      with:
-        # https://github.com/marketplace/actions/checkout#usage
-        fetch-depth: 0   # to fetch all history from all branches
-        fetch-tags: true
+      - name: Check out source and tags
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-    # Install uv
-    - name: Install uv
-      uses: astral-sh/setup-uv@v5
-      with:
-          python-version: 3.11
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential pkg-config
 
-    # Build dist
-    - name: Build the project
-      run: |
-        uv build --sdist
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
-    - name: Publish sdist to PyPI
-      env:
-        UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-      run: |
-        uv publish
+      - name: Install build and validation dependencies
+        run: |
+          uv venv .venv --python "$PYTHON_VERSION"
+          uv pip install --python .venv/bin/python \
+            'meson-python>=0.18,<0.19' \
+            'meson>=1.8.3,<2' \
+            'ninja>=1.11,<2' \
+            'Cython==3.0.12' \
+            'numpy==1.24.4' \
+            'twine>=6,<7'
+          uv pip check --python .venv/bin/python
+
+      - name: Validate package version and release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import os
+          import runpy
+          import tomllib
+          from pathlib import Path
+          from packaging.specifiers import SpecifierSet
+          from packaging.version import Version
+
+          project = tomllib.loads(Path('pyproject.toml').read_text())['project']
+          version = Version(runpy.run_path('tofu/version.py')['__version__'])
+          if Version(os.environ['PYTHON_VERSION']) not in SpecifierSet(project['requires-python']):
+              raise SystemExit('Workflow Python version is outside requires-python')
+          tag = os.environ.get('RELEASE_TAG', '')
+          if tag and Version(tag) != version:
+              raise SystemExit(f'Release tag {tag!r} does not match package version {version}')
+          print(f'Building {project["name"]} {version}')
+          PY
+
+      - name: Build source distribution
+        # Disable isolation so Meson uses the NumPy/Cython versions above.
+        # NumPy 1.24.4 satisfies the project's runtime requirement numpy<1.25.
+        # An sdist still needs compilers: meson-python runs meson setup.
+        run: uv build --sdist --no-build-isolation --python .venv/bin/python --out-dir dist
+
+      - name: Validate distribution metadata
+        run: .venv/bin/python -m twine check --strict dist/*.tar.gz
+
+      - name: Save validated source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish source distribution to PyPI
+        if: github.event_name == 'release' && github.event.action == 'published'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [[ -z "$UV_PUBLISH_TOKEN" ]]; then
+            echo '::error::Set the repository secret PYPI_API_TOKEN to a PyPI token scoped to tofu.'
+            exit 1
+          fi
+          uv publish --trusted-publishing never dist/*.tar.gz
